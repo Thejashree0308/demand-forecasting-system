@@ -43,8 +43,37 @@ def preprocess_data(df, date_col, target_col, product_col=None, selected_product
     df = df.sort_values(date_col)
     df = df.groupby(date_col)[target_col].sum().reset_index()
     df = df.rename(columns={date_col: "ds", target_col: "y"})
-    df = df.set_index("ds").asfreq("D")
-    df["y"] = df["y"].interpolate(method="linear")
+
+    inferred_freq = pd.infer_freq(df["ds"])
+    if inferred_freq is None:
+        inferred_freq = "D"
+
+    df = df.set_index("ds").asfreq(inferred_freq)
+
+    y = df["y"].copy()
+    stockout_mask = (y == 0) & (y.shift(1) > 0) & (y.shift(-1) > 0)
+    y[stockout_mask] = np.nan
+
+    y = y.interpolate(method="linear").ffill().bfill()
+
+    q1, q3 = y.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    if iqr > 0:
+        low_iqr = q1 - 1.5 * iqr
+        high_iqr = q3 + 1.5 * iqr
+        mean = y.mean()
+        std = y.std(ddof=0)
+        if std > 0:
+            low_z = mean - 3 * std
+            high_z = mean + 3 * std
+            low_cap = max(low_iqr, low_z)
+            high_cap = min(high_iqr, high_z)
+        else:
+            low_cap = low_iqr
+            high_cap = high_iqr
+        y = y.clip(lower=low_cap, upper=high_cap)
+
+    df["y"] = y
     df = df.reset_index()
     return df
 
@@ -159,16 +188,18 @@ def forecast_prophet(model, train, periods):
     return forecast_future, forecast
 
 
-def create_lag_features(df, n_lags=7):
+def create_lag_features(df, feature_df=None, n_lags=7):
     df_lag = df.copy()
     for lag in range(1, n_lags + 1):
         df_lag[f"lag_{lag}"] = df_lag["y"].shift(lag)
     df_lag = df_lag.dropna().reset_index(drop=True)
+    if feature_df is not None:
+        df_lag = df_lag.merge(feature_df, on="ds", how="left")
     return df_lag
 
 
 def train_xgboost(train_lag, test_lag):
-    feature_cols = [c for c in train_lag.columns if c.startswith("lag_")]
+    feature_cols = [c for c in train_lag.columns if c not in ["ds", "y"]]
     X_train, y_train = train_lag[feature_cols], train_lag["y"]
     X_test, y_test = test_lag[feature_cols], test_lag["y"]
 
@@ -232,7 +263,7 @@ def main():
         st.markdown("### 🔮 Model & Forecast Settings")
         model_choice = st.selectbox(
             "Choose Forecasting Model",
-            ["ARIMA", "Prophet", "XGBoost"],
+            ["Auto (Best)", "ARIMA", "Prophet", "XGBoost"],
             index=1,
         )
         horizon = st.slider("Forecast Horizon (days)", 7, 60, 30, step=1)
@@ -277,7 +308,6 @@ def main():
         st.error("Uploaded dataset is empty.")
         return
 
-    # Column selection
     with st.expander("🧮 Column Configuration", expanded=True):
         date_col = st.selectbox("Select Date Column", options=raw_df.columns)
         target_col = st.selectbox("Select Target (Sales) Column", options=raw_df.columns)
@@ -294,7 +324,15 @@ def main():
             if len(unique_values) > 0:
                 selected_product = st.selectbox("Select Product / Item", options=unique_values)
 
-    # Preprocess
+        exclude_cols = {date_col, target_col}
+        if product_col != "None":
+            exclude_cols.add(product_col)
+        candidate_extra = [c for c in raw_df.columns if c not in exclude_cols]
+        extra_feature_cols = st.multiselect(
+            "Optional external feature columns (holidays/promos/weather/etc. for XGBoost)",
+            options=candidate_extra,
+        )
+
     try:
         df = preprocess_data(
             raw_df,
@@ -307,9 +345,26 @@ def main():
         st.error(f"Error during preprocessing: {e}")
         return
 
+    feature_df_for_xgb = df[["ds"]].copy()
+    feature_df_for_xgb["day_of_week"] = feature_df_for_xgb["ds"].dt.weekday
+    feature_df_for_xgb["month"] = feature_df_for_xgb["ds"].dt.month
+    feature_df_for_xgb["is_weekend"] = feature_df_for_xgb["day_of_week"].isin([5, 6]).astype(int)
+
+    if extra_feature_cols:
+        ext = raw_df.copy()
+        ext[date_col] = pd.to_datetime(ext[date_col], errors="coerce")
+        ext = ext.dropna(subset=[date_col])
+        if product_col != "None" and selected_product is not None:
+            ext = ext[ext[product_col] == selected_product]
+        agg_dict = {col: "mean" for col in extra_feature_cols}
+        ext_agg = ext.groupby(date_col)[extra_feature_cols].mean().reset_index()
+        ext_agg = ext_agg.rename(columns={date_col: "ds"})
+        feature_df_for_xgb = feature_df_for_xgb.merge(ext_agg, on="ds", how="left")
+        feature_df_for_xgb = feature_df_for_xgb.ffill().bfill()
+
     st.success("Data successfully preprocessed for time series analysis.")
 
-    tab1, tab2, tab3 = st.tabs(["📊 EDA", "🤖 Model & Metrics", "📈 Forecast"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 EDA", "🤖 Model & Metrics", "📈 Forecast", "📦 Optimization"])
 
     with tab1:
         st.markdown("### Exploratory Data Analysis")
@@ -357,45 +412,82 @@ def main():
     forecast_df = None
     backtest_pred = None
     metrics = None
+    all_model_metrics = None
+    selected_model_name = None
 
     if train_button:
         with st.spinner("Training selected model and generating forecast..."):
-            if model_choice == "ARIMA":
-                arima_model = train_arima(train)
-                steps_test = len(test)
-                df_test_forecast = forecast_arima(arima_model, train, steps=steps_test)
-                backtest_pred = df_test_forecast.set_index("ds").loc[test["ds"]]["yhat"].values
-                mae, rmse, mape_val = compute_metrics(test["y"].values, backtest_pred)
-                metrics = {"MAE": mae, "RMSE": rmse, "MAPE": mape_val}
+            def run_arima(train_df, test_df, full_df):
+                model = train_arima(train_df)
+                steps_test_local = len(test_df)
+                df_test_fc = forecast_arima(model, train_df, steps=steps_test_local)
+                bt_pred = df_test_fc.set_index("ds").loc[test_df["ds"]]["yhat"].values
+                mae_l, rmse_l, mape_l = compute_metrics(test_df["y"].values, bt_pred)
+                fc_full = forecast_arima(model, full_df, steps=horizon)
+                return bt_pred, fc_full, {"MAE": mae_l, "RMSE": rmse_l, "MAPE": mape_l}
 
-                forecast_df = forecast_arima(arima_model, df, steps=horizon)
-
-            elif model_choice == "Prophet":
-                prophet_model = train_prophet(train)
-
-                total_periods = len(test)
-                forecast_future, full_forecast = forecast_prophet(prophet_model, train, periods=total_periods)
-                merged = test.merge(forecast_future[["ds", "yhat"]], on="ds", how="left")
-                backtest_pred = merged["yhat"].values
-                mae, rmse, mape_val = compute_metrics(merged["y"].values, backtest_pred)
-                metrics = {"MAE": mae, "RMSE": rmse, "MAPE": mape_val}
-
-                forecast_df_future, full_forecast_final = forecast_prophet(prophet_model, df, periods=horizon)
-                forecast_df = forecast_df_future
-
-            elif model_choice == "XGBoost":
-                lag_data = create_lag_features(df, n_lags=7)
-                lag_train = lag_data[lag_data["ds"] <= train["ds"].max()]
-                lag_test = lag_data[lag_data["ds"] > train["ds"].max()]
-                if lag_test.empty:
-                    st.error("Not enough data points after lagging to create a test set. Try increasing the dataset or reducing lags.")
+            def run_prophet(train_df, test_df, full_df):
+                model = train_prophet(train_df)
+                total_periods_local = len(test_df)
+                forecast_future_local, full_forecast_local = forecast_prophet(model, train_df, periods=total_periods_local)
+                merged_local = test_df.merge(forecast_future_local[["ds", "yhat"]], on="ds", how="left")
+                bt_pred = merged_local["yhat"].values
+                mae_l, rmse_l, mape_l = compute_metrics(merged_local["y"].values, bt_pred)
+                forecast_df_future_local, full_forecast_final_local = forecast_prophet(model, full_df, periods=horizon)
+                if forecast_df_future_local is None or forecast_df_future_local.empty:
+                    fc_full = full_forecast_final_local.tail(horizon)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
                 else:
-                    xgb_model, y_pred_test, feature_cols = train_xgboost(lag_train, lag_test)
-                    backtest_pred = y_pred_test
-                    mae, rmse, mape_val = compute_metrics(lag_test["y"].values, backtest_pred)
-                    metrics = {"MAE": mae, "RMSE": rmse, "MAPE": mape_val}
+                    fc_full = forecast_df_future_local
+                return bt_pred, fc_full, {"MAE": mae_l, "RMSE": rmse_l, "MAPE": mape_l}
 
-                    forecast_df = rolling_forecast_xgboost(xgb_model, df, feature_cols, horizon=horizon)
+            def run_xgb(train_df, test_df, full_df):
+                lag_data_local = create_lag_features(full_df, feature_df=feature_df_for_xgb, n_lags=7)
+                lag_train_local = lag_data_local[lag_data_local["ds"] <= train_df["ds"].max()]
+                lag_test_local = lag_data_local[lag_data_local["ds"] > train_df["ds"].max()]
+                if lag_test_local.empty:
+                    return None, None, None
+                model, y_pred_test_local, feature_cols_local = train_xgboost(lag_train_local, lag_test_local)
+                mae_l, rmse_l, mape_l = compute_metrics(lag_test_local["y"].values, y_pred_test_local)
+                fc_full = rolling_forecast_xgboost(model, full_df, feature_cols_local, horizon=horizon)
+                return y_pred_test_local, fc_full, {"MAE": mae_l, "RMSE": rmse_l, "MAPE": mape_l}
+
+            results = {}
+
+            if model_choice in ("ARIMA", "Auto (Best)"):
+                bt_arima, fc_arima, met_arima = run_arima(train, test, df)
+                results["ARIMA"] = (bt_arima, fc_arima, met_arima)
+
+            if model_choice in ("Prophet", "Auto (Best)"):
+                bt_prophet, fc_prophet, met_prophet = run_prophet(train, test, df)
+                results["Prophet"] = (bt_prophet, fc_prophet, met_prophet)
+
+            if model_choice in ("XGBoost", "Auto (Best)"):
+                bt_xgb, fc_xgb, met_xgb = run_xgb(train, test, df)
+                if bt_xgb is not None:
+                    results["XGBoost"] = (bt_xgb, fc_xgb, met_xgb)
+
+            if model_choice == "Auto (Best)":
+                if not results:
+                    st.error("No models could be trained. Check data length and settings.")
+                else:
+                    best_name = None
+                    best_mape = None
+                    for name, (_, _, met) in results.items():
+                        mape_val_local = met.get("MAPE")
+                        if mape_val_local is not None and not np.isnan(mape_val_local):
+                            if best_mape is None or mape_val_local < best_mape:
+                                best_mape = mape_val_local
+                                best_name = name
+                    if best_name is None:
+                        best_name = list(results.keys())[0]
+                    backtest_pred, forecast_df, metrics = results[best_name]
+                    selected_model_name = best_name
+                    all_model_metrics = {name: met for name, (_, _, met) in results.items()}
+            else:
+                if model_choice in results:
+                    backtest_pred, forecast_df, metrics = results[model_choice]
+                    selected_model_name = model_choice
+                    all_model_metrics = {model_choice: metrics}
 
         if metrics is not None:
             st.success("Model training & forecasting complete.")
@@ -410,6 +502,21 @@ def main():
             col1.metric("MAE", f"{metrics['MAE']:.2f}")
             col2.metric("RMSE", f"{metrics['RMSE']:.2f}")
             col3.metric("MAPE (%)", f"{metrics['MAPE']:.2f}")
+
+            if all_model_metrics is not None and len(all_model_metrics) > 1:
+                st.markdown("#### Model Comparison (Auto Selection)")
+                comp_rows = []
+                for name, met in all_model_metrics.items():
+                    comp_rows.append({
+                        "Model": name,
+                        "MAE": met["MAE"],
+                        "RMSE": met["RMSE"],
+                        "MAPE": met["MAPE"],
+                    })
+                comp_df = pd.DataFrame(comp_rows).sort_values("MAPE")
+                st.dataframe(comp_df.reset_index(drop=True))
+                if selected_model_name is not None:
+                    st.markdown(f"Selected model: **{selected_model_name}**")
 
             st.markdown("#### Actual vs Predicted (Backtest)")
             bt_df = test.copy()
@@ -454,6 +561,39 @@ def main():
 
             st.markdown("#### Download Forecast")
             st.markdown(get_table_download_link(forecast_df, filename="forecast.csv"), unsafe_allow_html=True)
+
+    with tab4:
+        st.markdown("### Inventory Optimization")
+
+        if forecast_df is None:
+            st.info("Train a model and generate a forecast to see optimization suggestions.")
+        else:
+            avg_daily_demand = df["y"].mean()
+            std_daily_demand = df["y"].std(ddof=0)
+
+            col_o1, col_o2 = st.columns(2)
+            with col_o1:
+                lead_time_days = st.number_input("Lead time (days)", min_value=1.0, value=7.0, step=1.0)
+                order_cost = st.number_input("Order cost per order (K)", min_value=1.0, value=100.0, step=10.0)
+                holding_cost = st.number_input("Annual holding cost per unit (H)", min_value=0.1, value=5.0, step=0.5)
+            with col_o2:
+                service_level_z = st.number_input("Service level z-score", min_value=0.0, value=1.65, step=0.05)
+                days_per_year = st.number_input("Days per year", min_value=1, value=365, step=1)
+
+            annual_demand = avg_daily_demand * days_per_year
+            if annual_demand <= 0 or holding_cost <= 0:
+                st.warning("Not enough demand data or invalid holding cost to compute EOQ.")
+            else:
+                eoq = np.sqrt((2 * annual_demand * order_cost) / holding_cost)
+                safety_stock = service_level_z * std_daily_demand * np.sqrt(lead_time_days)
+                reorder_point = avg_daily_demand * lead_time_days + safety_stock
+
+                col_r1, col_r2, col_r3 = st.columns(3)
+                col_r1.metric("EOQ (units)", f"{eoq:.2f}")
+                col_r2.metric("Safety Stock", f"{safety_stock:.2f}")
+                col_r3.metric("Reorder Point", f"{reorder_point:.2f}")
+
+                st.markdown("These values are based on the historical demand distribution and your cost parameters.")
 
 
 if __name__ == "__main__":
